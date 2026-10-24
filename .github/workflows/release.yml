@@ -130,3 +130,13 @@ jobs:
               --title "easysetup $tag" \
               --notes "Static installer for easysetup toolchains. linux/amd64 and linux/arm64, CGO disabled, no interpreter - runs on any Linux userland including distroless."
           fi
+
+          # Mark it latest explicitly.
+          #
+          # GitHub picks `releases/latest` by creation time, and two releases made
+          # on the same day can land in the wrong order - which happened: the
+          # action and the Containerfile both resolve the tag from
+          # /releases/latest, so they kept downloading the previous binary while
+          # the new one sat published and unused. Setting it here makes "latest"
+          # mean what this job just built.
+          gh release edit "$tag" --latest
