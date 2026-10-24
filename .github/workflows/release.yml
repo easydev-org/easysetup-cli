@@ -91,6 +91,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # `gh release create` shells out to git to work out which repository it is
+      # in. Without a checkout there is no .git, and it fails with
+      # "fatal: not a git repository" - after the assets have been downloaded and
+      # renamed, so the error arrives late and looks unrelated.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/bin
