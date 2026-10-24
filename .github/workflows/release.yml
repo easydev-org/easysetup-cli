@@ -1,0 +1,109 @@
+name: release
+
+# Cross-compile for both architectures and publish.
+#
+# CGO is disabled in every build, which is what makes cross-compilation trivial
+# and the result genuinely static: no libc to match, so the same binary runs on
+# debian, alpine and distroless alike. Verified with ldd: "not a dynamic
+# executable".
+#
+# arm64 is cross-compiled but cannot be executed on an amd64 runner without
+# qemu, so it is built and its format checked, and the amd64 binary is the one
+# whose behaviour is actually exercised.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: ubuntu-latest
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags='-s -w' -o easysetup .
+
+      - name: it must be static
+        run: |
+          set -euo pipefail
+          file easysetup
+          if ldd easysetup 2>&1 | grep -qi 'not a dynamic\|statically linked'; then
+            echo "statically linked"
+          else
+            echo "::error::not static:"; ldd easysetup; exit 1
+          fi
+
+      - name: it runs on this architecture
+        run: |
+          set -euo pipefail
+          ./easysetup --help > /dev/null
+          ./easysetup list | head -3
+          echo "binary runs on $(uname -m)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easysetup-linux-${{ matrix.goarch }}
+          path: easysetup
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/bin
+          merge-multiple: false
+
+      - name: name by architecture and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assets
+          for d in /tmp/bin/*/; do
+            goarch=$(basename "$d" | sed 's/^easysetup-linux-//')
+            install -m 0755 "$d/easysetup" "/tmp/assets/easysetup-linux-$goarch"
+            sha256sum "/tmp/assets/easysetup-linux-$goarch" \
+              | cut -d' ' -f1 > "/tmp/assets/easysetup-linux-$goarch.sha256"
+            ls -lh "/tmp/assets/easysetup-linux-$goarch"
+          done
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          echo "tag: $tag"
+          # Derived, not fixed: a re-run publishes a new version rather than
+          # silently replacing one a consumer may already have pinned.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" /tmp/assets/* --clobber
+          else
+            gh release create "$tag" /tmp/assets/* \
+              --title "easysetup $tag" \
+              --notes "Static installer for easysetup toolchains. linux/amd64 and linux/arm64, CGO disabled, no interpreter - runs on any Linux userland including distroless."
+          fi
