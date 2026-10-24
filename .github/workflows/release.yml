@@ -1,16 +1,16 @@
 name: release
 
-# Cross-compile for both architectures and publish.
+# Build for both architectures and publish.
 #
-# CGO is disabled in every build, which is what makes cross-compilation trivial
-# and the result genuinely static: no libc to match, so the same binary runs on
-# debian, alpine and distroless alike. Verified with ldd: "not a dynamic
-# executable".
+# CGO is disabled in every build, so the result is genuinely static: no libc to
+# match, and the same binary runs on debian, alpine and distroless alike.
+# Verified with ldd: "not a dynamic executable".
 #
-# Both architectures are built on amd64 runners by cross-compiling. An arm64
-# runner (ubuntu-24.04-arm) exists only on paid plans, and CGO=0 makes the cross
-# build exact anyway - there is no libc to bind to, so GOARCH is the whole story.
-# The arm64 binary is format-checked; the amd64 one is also executed.
+# Each architecture builds on its own native runner (ubuntu-latest is amd64,
+# ubuntu-24.04-arm is arm64) rather than cross-compiling, so the arm64 binary is
+# actually EXECUTED here rather than only format-checked. Cross-compiling would
+# probably produce the same bytes, but "probably" is not what a release should
+# rest on when a native runner is available.
 on:
   workflow_dispatch:
   push:
@@ -22,11 +22,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        goarch: [amd64, arm64]
+        include:
+          - goarch: amd64
+            runner: ubuntu-latest
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -54,26 +58,20 @@ jobs:
             echo "::error::not static"; exit 1; }
           echo "statically linked"
 
-      - name: the binary matches the requested architecture
+      # Runs on both, because each architecture has a native runner. This is the
+      # difference from cross-compiling: the arm64 binary is exercised, not just
+      # inspected.
+      - name: it runs
         run: |
           set -euo pipefail
-          file easysetup
-          case "${{ matrix.goarch }}" in
-            amd64) want='x86-64' ;;
-            arm64) want='ARM aarch64' ;;
+          arch=$(uname -m)
+          case "${{ matrix.goarch }}:$arch" in
+            amd64:x86_64|arm64:aarch64) : ;;
+            *) echo "::error::built ${{ matrix.goarch }} but the runner is $arch"; exit 1 ;;
           esac
-          file easysetup | grep -q "$want" || {
-            echo "::error::expected $want"; file easysetup; exit 1; }
-          echo "architecture ok: ${{ matrix.goarch }}"
-
-      # Only the native architecture can be executed here.
-      - name: it runs (amd64 only)
-        if: matrix.goarch == 'amd64'
-        run: |
-          set -euo pipefail
           ./easysetup --help > /dev/null
           ./easysetup list | head -3
-          echo "binary runs on $(uname -m)"
+          echo "binary runs on $arch"
 
       - uses: actions/upload-artifact@v4
         with:
