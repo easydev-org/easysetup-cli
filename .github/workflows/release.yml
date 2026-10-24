@@ -63,14 +63,22 @@ jobs:
       # inspected.
       - name: it runs
         run: |
-          set -euo pipefail
+          # No `set -o pipefail` here, deliberately. `easysetup list | head -3`
+          # closes the pipe when head has its three lines, the program dies on
+          # SIGPIPE, and pipefail turns that into a failed step - which is how
+          # this job failed while printing a perfectly good list. The same trap
+          # has bitten the release workflow in the other repository.
+          set -eu
           arch=$(uname -m)
           case "${{ matrix.goarch }}:$arch" in
             amd64:x86_64|arm64:aarch64) : ;;
             *) echo "::error::built ${{ matrix.goarch }} but the runner is $arch"; exit 1 ;;
           esac
           ./easysetup --help > /dev/null
-          ./easysetup list | head -3
+          # Capture and slice instead of piping: no SIGPIPE, no pipefail question.
+          out=$(./easysetup list)
+          echo "$out" | head -3
+          [ -n "$out" ] || { echo "::error::list produced nothing"; exit 1; }
           echo "binary runs on $arch"
 
       - uses: actions/upload-artifact@v4
