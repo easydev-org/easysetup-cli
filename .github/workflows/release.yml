@@ -7,9 +7,10 @@ name: release
 # debian, alpine and distroless alike. Verified with ldd: "not a dynamic
 # executable".
 #
-# arm64 is cross-compiled but cannot be executed on an amd64 runner without
-# qemu, so it is built and its format checked, and the amd64 binary is the one
-# whose behaviour is actually exercised.
+# Both architectures are built on amd64 runners by cross-compiling. An arm64
+# runner (ubuntu-24.04-arm) exists only on paid plans, and CGO=0 makes the cross
+# build exact anyway - there is no libc to bind to, so GOARCH is the whole story.
+# The arm64 binary is format-checked; the amd64 one is also executed.
 on:
   workflow_dispatch:
   push:
@@ -21,15 +22,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goarch: amd64
-            runner: ubuntu-latest
-          - goarch: arm64
-            runner: ubuntu-24.04-arm
+        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -51,13 +48,27 @@ jobs:
         run: |
           set -euo pipefail
           file easysetup
-          if ldd easysetup 2>&1 | grep -qi 'not a dynamic\|statically linked'; then
-            echo "statically linked"
-          else
-            echo "::error::not static:"; ldd easysetup; exit 1
-          fi
+          out=$(ldd easysetup 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -qE 'not a dynamic executable|statically linked' || {
+            echo "::error::not static"; exit 1; }
+          echo "statically linked"
 
-      - name: it runs on this architecture
+      - name: the binary matches the requested architecture
+        run: |
+          set -euo pipefail
+          file easysetup
+          case "${{ matrix.goarch }}" in
+            amd64) want='x86-64' ;;
+            arm64) want='ARM aarch64' ;;
+          esac
+          file easysetup | grep -q "$want" || {
+            echo "::error::expected $want"; file easysetup; exit 1; }
+          echo "architecture ok: ${{ matrix.goarch }}"
+
+      # Only the native architecture can be executed here.
+      - name: it runs (amd64 only)
+        if: matrix.goarch == 'amd64'
         run: |
           set -euo pipefail
           ./easysetup --help > /dev/null
