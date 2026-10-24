@@ -31,8 +31,16 @@ import (
 )
 
 const (
-	releaseBase = "https://github.com/easydev-org/easysetup/releases/download"
+	// Every setup is an asset of ONE release, tagged `setups`. The tag is fixed
+	// rather than dated so each asset keeps one stable URL: a dated tag would make
+	// every publish a new release, and an unchanged setup would drop out of
+	// /releases/latest the moment anything else changed.
+	releaseTag  = "setups"
+	releaseBase = "https://github.com/easydev-org/easysetup/releases/download/" + releaseTag
 	userAgent   = "easysetup-cli"
+
+	// Checksums are one file for the whole release, not one beside each tarball.
+	sumsAsset = "SHA256SUMS"
 )
 
 // Installer carries what every step needs.
@@ -48,6 +56,12 @@ type Installer struct {
 	Token     string
 	Client    *http.Client
 	Out       io.Writer
+
+	// sums caches SHA256SUMS, which is one file for the whole release. Fetching it
+	// once per run matters: `install node python jq` resolves a dozen setups, and
+	// re-downloading a checksum file for each would be both slow and a way to
+	// exhaust the anonymous quota on something that never changes mid-run.
+	sums map[string]string
 }
 
 // NewInstaller builds one with sensible defaults.
@@ -108,8 +122,19 @@ func (i *Installer) Install(s *Setup) error {
 		return nil
 	}
 
-	url := fmt.Sprintf("%s/%s/%s", releaseBase, s.Dir, s.Artifact)
+	// All assets live at the release root now, not one directory per setup. The
+	// old layout was .../download/<tag>/<dir>/<artifact> because each setup had
+	// its own release; with one release they are siblings.
+	url := releaseBase + "/" + s.Artifact
 	fmt.Fprintf(i.Out, "==> %s\n    fetch: %s\n", s.Dir, url)
+
+	// Resolve the expected checksum BEFORE downloading the tarball. It is a small
+	// file fetched once per run, and doing it first means a missing entry fails
+	// immediately rather than after a 1.5 GB download.
+	wantSum, err := i.expectedSum(s.Artifact)
+	if err != nil {
+		return err
+	}
 
 	body, err := i.get(url)
 	if err != nil {
@@ -117,20 +142,58 @@ func (i *Installer) Install(s *Setup) error {
 	}
 	defer body.Close()
 
-	// The pin lives beside the release and is computed by the publishing job from
-	// the file it is about to upload, so it cannot describe a tarball that was
-	// never produced.
-	wantSum, err := i.fetchText(url + ".sha256")
-	if err != nil {
-		return fmt.Errorf("no sha256 published for %s: %w", s.Dir, err)
-	}
-	wantSum = strings.Fields(wantSum)[0]
-
 	if err := i.unpackVerified(body, wantSum, s.Artifact); err != nil {
 		return err
 	}
 	fmt.Fprintf(i.Out, "    unpacked %s\n", i.storeOf(s.Dir))
 	return nil
+}
+
+// expectedSum returns the pinned checksum for one asset.
+//
+// The publishing job computes each checksum from the file it is about to upload
+// and merges them into a single SHA256SUMS asset, so a pin can never describe a
+// tarball that was not published.
+func (i *Installer) expectedSum(artifact string) (string, error) {
+	if i.sums == nil {
+		raw, err := i.fetchText(releaseBase + "/" + sumsAsset)
+		if err != nil {
+			return "", fmt.Errorf("fetch %s: %w", sumsAsset, err)
+		}
+		i.sums = map[string]string{}
+		// coreutils format: "<hex>  <name>", with possible "*" for binary mode.
+		// The name is stored by basename, because the file may have been written
+		// by `sha256sum /some/path/foo.tar.zst` - which records the path rather
+		// than the bare name, and looking a tarball up by filename would then fail
+		// for every entry. Older releases of ours did exactly that.
+		for _, line := range strings.Split(raw, "\n") {
+			f := strings.Fields(line)
+			if len(f) < 2 {
+				continue
+			}
+			name := strings.TrimPrefix(f[1], "*")
+			name = filepath.Base(name)
+			i.sums[name] = f[0]
+		}
+		if len(i.sums) == 0 {
+			return "", fmt.Errorf("%s is empty or malformed", sumsAsset)
+		}
+	}
+	sum, ok := i.sums[artifact]
+	if !ok {
+		// List a few known keys: when this fires the useful question is what the
+		// parse actually produced, not simply that this name is absent.
+		sample := make([]string, 0, 3)
+		for k := range i.sums {
+			sample = append(sample, k)
+			if len(sample) == 3 {
+				break
+			}
+		}
+		return "", fmt.Errorf("%s has no %s entry - the release is inconsistent\n"+
+			"  parsed %d entries, e.g. %v", sumsAsset, artifact, len(i.sums), sample)
+	}
+	return sum, nil
 }
 
 // storeOf reads back what the tarball recorded.
@@ -194,9 +257,18 @@ func (i *Installer) fetchText(url string) (string, error) {
 		return "", err
 	}
 	defer body.Close()
-	b, err := io.ReadAll(io.LimitReader(body, 4096))
+	// 1 MiB, not 4 KiB. SHA256SUMS holds one ~110-byte line per setup, so 199 of
+	// them already exceed 4 KiB - the limit silently truncated the file and every
+	// setup past the cutoff reported "no entry in SHA256SUMS", which looked like a
+	// broken release rather than a short read. 1 MiB is ~9000 entries of headroom.
+	const maxAux = 1 << 20
+	b, err := io.ReadAll(io.LimitReader(body, maxAux))
 	if err != nil {
 		return "", err
+	}
+	if len(b) >= maxAux {
+		return "", fmt.Errorf("%s is larger than %d bytes; refusing to parse a "+
+			"truncated file", url, maxAux)
 	}
 	if len(strings.Fields(string(b))) == 0 {
 		return "", errors.New("empty checksum file")

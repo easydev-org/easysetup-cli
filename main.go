@@ -39,6 +39,12 @@ func main() {
 		cmdPrepare(inst)
 		return
 	}
+	// `checksum` needs no metadata either: it is used to verify a file that was
+	// just downloaded, including possibly this binary before anything is trusted.
+	if cmd == "checksum" {
+		cmdChecksum(args)
+		return
+	}
 
 	// The manifest and the dependency graph are fetched at run time, never
 	// embedded: embedding would mean recompiling the binary whenever a setup is
@@ -83,6 +89,9 @@ func usage() {
   easysetup env [path]          write env.sh (default /opt/setup/env.sh) and print it
   easysetup prepare             make /nix/store exist and be writable (needs root)
   easysetup verify <name>...    check an install without changing anything
+  easysetup checksum <file>     print its sha256 (no externals needed)
+  easysetup checksum --check <sumfile> <file>
+                                verify against a published "hex  name" file
 
 A bare tool name means the newest version: "node" is node-26, "node-24" is 24.
 Python's tools need a suffix when both interpreters are present: "mypy-py3.13".
