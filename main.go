@@ -60,7 +60,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	clo, err := LoadClosures(filepath.Join(work, "closures.json"))
+	clo, err := LoadClosures(filepath.Join(work, "closures-"+archName()+".json"))
 	if err != nil {
 		fail(err)
 	}

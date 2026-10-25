@@ -21,7 +21,10 @@ func fetchMetadata(inst *Installer) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, name := range []string{"matrix-nix.yml", "closures.json"} {
+	// The graph is per architecture - the store paths inside it are - so this
+	// fetches the one matching the running binary. A shared name would either be
+	// wrong for one architecture or need both downloaded and one thrown away.
+	for _, name := range []string{"matrix-nix.yml", "closures-" + archName() + ".json"} {
 		if err := inst.downloadTo(filepath.Join(work, name), rawBase+"/"+name); err != nil {
 			os.RemoveAll(work)
 			return "", fmt.Errorf("fetch %s: %w", name, err)

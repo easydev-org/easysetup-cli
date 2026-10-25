@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -31,17 +32,39 @@ import (
 )
 
 const (
-	// Every setup is an asset of ONE release, tagged `setups`. The tag is fixed
-	// rather than dated so each asset keeps one stable URL: a dated tag would make
-	// every publish a new release, and an unchanged setup would drop out of
-	// /releases/latest the moment anything else changed.
-	releaseTag  = "setups"
-	releaseBase = "https://github.com/easydev-org/easysetup/releases/download/" + releaseTag
-	userAgent   = "easysetup-cli"
+	// One release per architecture. The tag is fixed rather than dated so each
+	// asset keeps one stable URL, and separate tags mean each architecture gets
+	// the whole 1000-asset allowance rather than sharing it.
+	userAgent = "easysetup-cli"
 
 	// Checksums are one file for the whole release, not one beside each tarball.
 	sumsAsset = "SHA256SUMS"
 )
+
+// releaseBase is where this build's architecture lives.
+//
+// Derived from runtime.GOARCH, not from a build tag: the same binary source
+// compiles for both, and a binary that looked up the wrong release would install
+// closures it cannot execute.
+var (
+	releaseTag  = "setups-" + archName()
+	releaseBase = "https://github.com/easydev-org/easysetup/releases/download/" + releaseTag
+)
+
+// archName maps Go's GOARCH to the name the releases use.
+func archName() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "amd64"
+	case "arm64":
+		return "arm64"
+	default:
+		// Better a clear failure than a 404 chain: no release exists for this
+		// architecture, and every URL below would be wrong.
+		panic("easysetup: unsupported architecture " + runtime.GOARCH +
+			"; only linux/amd64 and linux/arm64 are published")
+	}
+}
 
 // Installer carries what every step needs.
 type Installer struct {
