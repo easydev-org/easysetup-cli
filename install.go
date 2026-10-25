@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -338,11 +339,21 @@ func unpackZstdTar(src io.Reader, root string) error {
 	}
 	defer dec.Close()
 
+	// Fresh collectors for this extraction; the maps are package-level because
+	// extractOne has no other way to hand the modes back.
+	dirModes = map[string]os.FileMode{}
+	fileModes = map[string]os.FileMode{}
+
 	tr := tar.NewReader(dec)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			return nil
+			// Everything is written; now apply the archive's real modes.
+			//
+			// This is the step that makes a non-root install work at all: the tree
+			// is written with permissive modes and then locked down, instead of
+			// being created read-only and never populated.
+			return restoreModes()
 		}
 		if err != nil {
 			return err
@@ -374,8 +385,26 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&os.ModePerm); err != nil {
+		// 0755, NOT the archive's mode. nix store directories are 0555, and the
+		// owner of a 0555 directory cannot create entries in it either - so
+		// creating it with 0555 and then writing the files inside fails with
+		// "permission denied", as its own owner.
+		//
+		// This only shows up for a non-root installer: root ignores the permission
+		// bits, so a container worked and a bare runner did not. The final modes
+		// are restored by restoreModes once everything has been written.
+		if err := os.MkdirAll(target, 0o755); err != nil {
 			return err
+		}
+		// A directory entry may be seen again after its children; keep the mode so
+		// it can be applied at the end.
+		//
+		// Except root itself, and the store directory above it. The archive records
+		// `nix/` and `nix/store/` as 0555, but they belong to the system, not to
+		// this setup: chmod'ing them would fail for a non-root user (they are
+		// root-owned) and, worse, would lock the store for every later install.
+		if clean != "/" && clean != "/nix" && clean != "/nix/store" {
+			dirModes[target] = os.FileMode(hdr.Mode) & os.ModePerm
 		}
 	case tar.TypeSymlink:
 		os.MkdirAll(filepath.Dir(target), 0o755)
@@ -392,7 +421,11 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&os.ModePerm)
+		// 0644 while writing. A nix store file is usually 0444, and opening a file
+		// for writing that is already 0444 fails on the second run - the same
+		// class of mistake as the directory above. The real mode is applied by
+		// restoreModes afterwards.
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
@@ -403,9 +436,59 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 		if err := f.Close(); err != nil {
 			return err
 		}
+		fileModes[target] = os.FileMode(hdr.Mode) & os.ModePerm
 	default:
 		// Character/block devices and fifos do not appear in these closures; skip
 		// rather than fail, since a refusal here would be puzzling.
+	}
+	return nil
+}
+
+// dirModes and fileModes collect the archive's real modes so they can be applied
+// after the tree has been written.
+//
+// Package-level rather than threaded through every call because there is exactly
+// one extraction at a time per process, and the alternative is passing a
+// collector down four call layers for no benefit.
+var (
+	dirModes  = map[string]os.FileMode{}
+	fileModes = map[string]os.FileMode{}
+)
+
+// restoreModes applies the recorded modes, deepest first.
+//
+// Deepest first matters for directories: setting a parent to 0555 before
+// chmod'ing its children would make the children unreachable even to their owner,
+// which is the same trap in a different order.
+func restoreModes() error {
+	paths := make([]string, 0, len(dirModes)+len(fileModes))
+	for p := range dirModes {
+		paths = append(paths, p)
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		// Longer paths are deeper; sorting by descending length is enough here
+		// because all of them live under one root.
+		return len(paths[i]) > len(paths[j])
+	})
+	for _, p := range paths {
+		if err := os.Chmod(p, dirModes[p]); err != nil {
+			// A store path already owned by someone else - root, from an earlier
+			// install - can be read but not chmod'ed by this user. That is not a
+			// failure of THIS install: the entry was already there with its correct
+			// mode. Insisting would make a second install on a shared machine fail
+			// for no reason.
+			if !errors.Is(err, os.ErrPermission) {
+				return fmt.Errorf("chmod %s: %w", p, err)
+			}
+		}
+	}
+	// Files can be done in any order - they have no children.
+	for p, m := range fileModes {
+		if err := os.Chmod(p, m); err != nil {
+			if !errors.Is(err, os.ErrPermission) {
+				return fmt.Errorf("chmod %s: %w", p, err)
+			}
+		}
 	}
 	return nil
 }

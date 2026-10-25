@@ -88,10 +88,19 @@ func cmdInstall(inst *Installer, man *Manifest, clo *Closures, args []string) {
 		installed = append(installed, j.setup.Dir)
 	}
 
-	if err := inst.WriteEnv(envPath); err != nil {
-		fail(err)
-	}
 	fmt.Fprintf(inst.Out, "==> installed: %s\n", strings.Join(installed, " "))
+
+	// env.sh is a convenience, not part of the install.
+	//
+	// /opt/setup is not writable by a normal user, so writing there fails on a
+	// bare runner while the tools themselves installed perfectly. Treating that as
+	// fatal turned a successful install into a failed one over a file nobody has to
+	// have - `easysetup env <path>` regenerates it anywhere, any time.
+	if err := inst.WriteEnv(envPath); err != nil {
+		fmt.Fprintf(inst.Out, "    note: could not write %s (%v)\n", envPath, err)
+		fmt.Fprintf(inst.Out, "    the tools are installed; run 'easysetup env <path>' to get an env script\n")
+		return
+	}
 	fmt.Fprintf(inst.Out, "    now run:  . %s\n", envPath)
 }
 
