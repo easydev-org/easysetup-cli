@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -239,15 +240,39 @@ exist and be usable. Run one of:
   or in the image:    RUN mkdir -p /nix/store && chmod -R 777 /nix`, store))
 	}
 
+	// Not root: use sudo, as the shell installer does.
+	//
+	// `mkdir /nix` needs root because / is root-owned. A bare GitHub runner is a
+	// normal user with passwordless sudo, which is the common case this missed -
+	// the first version only tried the direct mkdir and failed with "mkdir /nix:
+	// permission denied" while a container (root) worked, so the failure only
+	// appeared on the one kind of runner that could not be tested locally.
 	if err := os.MkdirAll(store, 0o777); err != nil {
-		fail(fmt.Errorf(`cannot create %s: %w
+		if _, lerr := exec.LookPath("sudo"); lerr != nil {
+			fail(fmt.Errorf(`cannot create %s: %w
 
 Every easysetup binary names /nix/store as its ELF interpreter, so the path must
 exist. Options:
 
   as root:            easysetup prepare
+  with sudo:          sudo easysetup prepare
   or in the image:    RUN mkdir -p /nix/store && chmod -R 777 /nix
   or use the root tag of a distroless image for this one step: gcr.io/distroless/static:latest`, store, err))
+		}
+		fmt.Printf("not root; creating %s with sudo\n", store)
+		for _, cmd := range [][]string{
+			{"sudo", "mkdir", "-p", store},
+			{"sudo", "chmod", "777", "/nix"},
+			{"sudo", "chmod", "777", store},
+		} {
+			c := exec.Command(cmd[0], cmd[1:]...)
+			c.Stdout, c.Stderr = os.Stdout, os.Stderr
+			if err := c.Run(); err != nil {
+				fail(fmt.Errorf("%s: %w", strings.Join(cmd, " "), err))
+			}
+		}
+		fmt.Printf("created %s (mode 777)\n", store)
+		return
 	}
 	_ = os.Chmod("/nix", 0o777)
 	_ = os.Chmod(store, 0o777)
