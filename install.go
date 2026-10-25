@@ -393,6 +393,12 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 		// This only shows up for a non-root installer: root ignores the permission
 		// bits, so a container worked and a bare runner did not. The final modes
 		// are restored by restoreModes once everything has been written.
+		//
+		// makeWritable first: the directory may already exist from ANOTHER setup's
+		// tarball, which left it 0555. Two setups can legitimately contain the same
+		// store path - java and maven both carry set-java-classpath-hook - and the
+		// second one cannot write into what the first one locked down.
+		makeWritable(target)
 		if err := os.MkdirAll(target, 0o755); err != nil {
 			return err
 		}
@@ -418,6 +424,11 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 		src := filepath.Join(root, filepath.Clean("/"+hdr.Linkname))
 		return os.Link(src, target)
 	case tar.TypeReg, tar.TypeRegA:
+		// Same reason: an earlier setup may have created this file 0444. Overwriting
+		// it is correct - identical content from an identical store path - but the
+		// mode has to allow the write first.
+		makeWritable(filepath.Dir(target))
+		makeWritable(target)
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
@@ -442,6 +453,25 @@ func extractOne(tr *tar.Reader, hdr *tar.Header, root string) error {
 		// rather than fail, since a refusal here would be puzzling.
 	}
 	return nil
+}
+
+// makeWritable adds owner-write to a path that already exists, so it can be
+// replaced.
+//
+// Needed because two setups can carry the same store path. nix paths are
+// content-addressed, so "the same path" means "the same bytes" - overwriting is
+// correct and the result is identical either way. What is not correct is failing
+// because the first tarball stored it read-only, which is what happened with
+// java+maven and their shared set-java-classpath-hook.
+//
+// Best-effort: a path owned by another user cannot be chmod'ed, and the caller's
+// subsequent open will report a clearer error than this could.
+func makeWritable(path string) {
+	if st, err := os.Lstat(path); err == nil && st.Mode()&os.ModeSymlink == 0 {
+		if st.Mode().Perm()&0o200 == 0 {
+			_ = os.Chmod(path, st.Mode().Perm()|0o200)
+		}
+	}
 }
 
 // dirModes and fileModes collect the archive's real modes so they can be applied
