@@ -120,8 +120,28 @@ func (m *Manifest) Resolve(name string) (*Setup, error) {
 		return asTool[0], nil
 	}
 	if len(asTool) > 1 {
-		sort.Slice(asTool, func(i, j int) bool {
-			return VersionLess(asTool[i].Version, asTool[j].Version)
+		// Newest version wins; on a tie the UNSUFFIXED entry wins.
+		//
+		// The tie is not hypothetical: pip-26.1.2 (for python 3.14) and
+		// pip-26.1.2-py3.13 (for 3.13) share a version string, because the pip
+		// release is the same for both. sort.Slice is not stable, so the winner
+		// was whichever the sort happened to leave last - and it picked the 3.13
+		// build. `install python pip` then installed python 3.14 alongside a pip
+		// bound to 3.13, and `python3` had no pip module at all.
+		//
+		// Sort ASCENDING by (version, suffixed?), then take the last - so the
+		// winner is the highest version, and on a tie the UNSUFFIXED one.
+		//
+		// The tie-break has to sort the suffixed entry EARLIER for the last element
+		// to be the plain one: `less(suffixed, plain)` must be true. Writing it the
+		// other way round (as a first attempt did) leaves the suffixed entry last
+		// and picks exactly the wrong one.
+		sort.SliceStable(asTool, func(i, j int) bool {
+			if asTool[i].Version != asTool[j].Version {
+				return VersionLess(asTool[i].Version, asTool[j].Version)
+			}
+			// Equal version: suffixed sorts before plain, so plain ends up last.
+			return asTool[i].Suffix != "" && asTool[j].Suffix == ""
 		})
 		return asTool[len(asTool)-1], nil
 	}
