@@ -19,6 +19,15 @@ import (
 )
 
 func TestReleaseRedirect(t *testing.T) {
+	// Network, so it is not part of the default suite: `go test ./...` in a release
+	// job should not fail because a release asset was briefly unreachable, and a
+	// check that goes red for an unrelated reason stops being read.
+	//
+	//   EASYSETUP_NET_TESTS=1 go test -run TestReleaseRedirect
+	if os.Getenv("EASYSETUP_NET_TESTS") == "" {
+		t.Skip("set EASYSETUP_NET_TESTS=1 to run the download check")
+	}
+
 	url := releaseBase + "/jq-1.8.2/jq-1.8.2-debian-trixie-amd64.tar.zst"
 
 	// Print what the proxy machinery resolves for THIS url. A bare &http.Request{}
