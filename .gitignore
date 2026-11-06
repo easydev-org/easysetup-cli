@@ -1,0 +1,2 @@
+# The built binary (go build ./... produces one in the module root).
+/easysetup-cli

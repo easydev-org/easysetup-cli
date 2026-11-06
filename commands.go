@@ -96,7 +96,7 @@ func cmdInstall(inst *Installer, man *Manifest, clo *Closures, args []string) {
 	// bare runner while the tools themselves installed perfectly. Treating that as
 	// fatal turned a successful install into a failed one over a file nobody has to
 	// have - `easysetup env <path>` regenerates it anywhere, any time.
-	if err := inst.WriteEnv(envPath); err != nil {
+	if err := inst.WriteEnv(envPath, clo); err != nil {
 		fmt.Fprintf(inst.Out, "    note: could not write %s (%v)\n", envPath, err)
 		fmt.Fprintf(inst.Out, "    the tools are installed; run 'easysetup env <path>' to get an env script\n")
 		return
@@ -120,20 +120,15 @@ func cmdList(man *Manifest) {
 const envPath = "/opt/setup/env.sh"
 
 // cmdEnv writes env.sh from everything installed and prints it.
-func cmdEnv(inst *Installer, args []string) {
+func cmdEnv(inst *Installer, clo *Closures, args []string) {
+	out := envPath
 	if len(args) > 0 {
-		out := args[0]
-		if err := inst.WriteEnv(out); err != nil {
-			fail(err)
-		}
-		b, _ := os.ReadFile(out)
-		fmt.Print(string(b))
-		return
+		out = args[0]
 	}
-	if err := inst.WriteEnv(envPath); err != nil {
+	if err := inst.WriteEnv(out, clo); err != nil {
 		fail(err)
 	}
-	b, _ := os.ReadFile(envPath)
+	b, _ := os.ReadFile(out)
 	fmt.Print(string(b))
 }
 
@@ -178,7 +173,25 @@ func cmdVerify(inst *Installer, man *Manifest, args []string) {
 // It scans rather than taking the list it just installed, for the same reason
 // install.sh does: this runs once per invocation, and generating from "what this
 // call installed" would make a second call erase the first.
-func (i *Installer) WriteEnv(path string) error {
+//
+// Besides PATH, it exports the LIBRARY SEARCH paths of every installed store
+// path's `lib` and `lib64` directory. That is not cosmetic:
+//
+//   - nixpkgs' swift ships its runtime .so files in $out/lib but compiles a
+//     search path of $out/lib/swift/linux into the driver, so `swiftc a.swift`
+//     fails with "cannot find -lswiftCore". A wrapper script around swiftc could
+//     add -L, but that must be baked into the tarball, and the tarball is built
+//     from a nix expression that cannot be rebuilt cheaply (no cache entry).
+//   - more generally, a compiler in one store path links against libraries in
+//     ANOTHER (swift's libFoundation.so needs ICU, which is a sibling store
+//     path); without those directories on the link path the error is
+//     `undefined reference to uloc_toLegacyKey' -- an ICU symbol, from a file
+//     whose own path the user never named.
+//
+// NIX_LDFLAGS is what the nix cc wrapper reads; LIBRARY_PATH is what gcc/clang/
+// ld consult directly. Setting both covers a driver that shells out to the
+// compiler AND one that invokes it in-process.
+func (i *Installer) WriteEnv(path string, clo *Closures) error {
 	// The registry lives under <Root>/nix, beside the store, because that is where
 	// the tarball puts it.
 	nixDir := filepath.Join(i.Root, "nix")
@@ -187,6 +200,7 @@ func (i *Installer) WriteEnv(path string) error {
 		return err
 	}
 	var paths []string
+	var stores []string
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "setup-root-") {
 			continue
@@ -197,13 +211,22 @@ func (i *Installer) WriteEnv(path string) error {
 		}
 		store, dirs, _ := strings.Cut(strings.TrimSpace(string(raw)), "|")
 		if store == "" || store == "none" {
+			// A library set (base) carries no executables but its store paths are
+			// still on the link path, so keep the NAME and let the closure graph
+			// resolve it below.
+			if store == "none" {
+				stores = append(stores, strings.TrimPrefix(e.Name(), "setup-root-"))
+			}
 			continue
 		}
+		stores = append(stores, strings.TrimPrefix(e.Name(), "setup-root-"))
 		for _, d := range strings.Fields(dirs) {
 			paths = append(paths, store+"/"+d)
 		}
 	}
 	sort.Strings(paths)
+
+	libs := i.libraryDirs(stores, clo)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -214,7 +237,90 @@ func (i *Installer) WriteEnv(path string) error {
 		fmt.Fprintf(&b, "PATH=\"%s:${PATH}\"\n", p)
 	}
 	b.WriteString("export PATH\n")
+
+	if len(libs) > 0 {
+		joined := strings.Join(libs, ":")
+		// LIBRARY_PATH is the LINK-time search path: gcc/clang/ld consult it, and
+		// a program built with it records the dependency it resolved in its own
+		// binary. That is what fixes "undefined reference to uloc_*": the linker
+		// can see ICU while resolving libFoundation.so's symbols.
+		fmt.Fprintf(&b, "LIBRARY_PATH=\"%s${LIBRARY_PATH:+:${LIBRARY_PATH}}\"\n", joined+":")
+		// LD_LIBRARY_PATH is the RUN-time path and is deliberately NOT set:
+		//   - a compiled program gets its dependencies from the library the linker
+		//     resolved, so it does not need it;
+		//   - putting nix's glibc on the loader path BREAKS unrelated processes:
+		//     a nix glibc's ld.so and libc are not interchangeable with the host's,
+		//     and mixing them crashes whatever loads next ("GLIBC_2.xx not found",
+		//     or an immediate segfault).
+		// Only an interpreter that dlopens its own runtime in-process would need
+		// it, and no setup here does that.
+		// NIX_LDFLAGS: read by the nix cc wrapper when a driver shells out.
+		var flags strings.Builder
+		for _, l := range libs {
+			flags.WriteString(" -L" + l)
+		}
+		fmt.Fprintf(&b, "NIX_LDFLAGS=\"%s${NIX_LDFLAGS:+${NIX_LDFLAGS}}\"\n", strings.TrimSpace(flags.String()))
+		b.WriteString("export LIBRARY_PATH NIX_LDFLAGS\n")
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// libraryDirs returns the `lib`/`lib64` directories of every installed setup's
+// closure, dependencies included.
+//
+// The dependency graph is what makes this correct: a tarball carries only its
+// OWN paths (a delta), so swift's tarball has ICU but a setup whose dependency
+// provides the library would not. Walking `Deps` covers both.
+//
+// Directories that do not exist are skipped: a closure lists paths for
+// libraries, documentation and executables alike, and a `-L` pointing at a
+// missing directory is noise in every link command.
+func (i *Installer) libraryDirs(setups []string, clo *Closures) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(store string) {
+		if store == "" || store == "none" || seen[store] {
+			return
+		}
+		seen[store] = true
+		for _, sub := range []string{"lib", "lib64"} {
+			d := filepath.Join(store, sub)
+			if st, err := os.Stat(d); err == nil && st.IsDir() {
+				out = append(out, d)
+			}
+		}
+	}
+	if clo == nil {
+		return nil
+	}
+	var visit func(string)
+	visit = func(name string) {
+		if seen["setup:"+name] {
+			return
+		}
+		seen["setup:"+name] = true
+		e, ok := clo.Setups[name]
+		if !ok {
+			return
+		}
+		for _, d := range e.Deps {
+			visit(d)
+		}
+		add(e.Store)
+		for _, p := range e.Own {
+			add(p)
+		}
+	}
+	for _, s := range setups {
+		visit(s)
+	}
+	// `base` is the shared library set every setup builds on, and it is not a
+	// dependency edge of every setup in the graph, so add it explicitly.
+	for _, p := range clo.Base {
+		add(p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // cmdPrepare makes /nix/store exist and be writable.

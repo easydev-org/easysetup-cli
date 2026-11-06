@@ -71,7 +71,7 @@ func main() {
 	case "list":
 		cmdList(man)
 	case "env":
-		cmdEnv(inst, args)
+		cmdEnv(inst, clo, args)
 	case "verify":
 		cmdVerify(inst, man, args)
 	default:
